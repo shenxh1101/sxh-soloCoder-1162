@@ -17,6 +17,8 @@ class PreviewGenerator:
         silent_segments: List[SilentSegment],
         total_duration_ms: float,
         window_ms: float,
+        buffer_before_ms: float = 0.0,
+        buffer_after_ms: float = 0.0,
     ) -> str:
         if len(rms_values) == 0:
             return "[No audio data]"
@@ -95,6 +97,31 @@ class PreviewGenerator:
                     f"(duration: {seg.duration_sec:.2f}s)"
                 )
 
+        non_silent_split_points = []
+        if len(silent_segments) > 0:
+            cursor = 0.0
+            total_ms = total_duration_ms
+            seg_idx = 1
+            for seg in silent_segments:
+                if seg.start_ms > cursor:
+                    start_buffered = max(0.0, cursor - buffer_after_ms)
+                    end_buffered = min(total_ms, seg.start_ms + buffer_before_ms)
+                    non_silent_split_points.append((seg_idx, start_buffered / 1000.0, end_buffered / 1000.0, (end_buffered - start_buffered) / 1000.0))
+                    seg_idx += 1
+                cursor = seg.end_ms
+            if cursor < total_ms:
+                start_buffered = max(0.0, cursor - buffer_before_ms)
+                end_buffered = total_ms + buffer_after_ms
+                end_buffered = min(total_ms, end_buffered)
+                non_silent_split_points.append((seg_idx, start_buffered / 1000.0, end_buffered / 1000.0, (end_buffered - start_buffered) / 1000.0))
+
+        if non_silent_split_points:
+            lines.append(f"\n  After splitting with buffer: {len(non_silent_split_points)} output segment(s):")
+            for idx, start_sec, end_sec, dur_sec in non_silent_split_points:
+                lines.append(
+                    f"    [{idx:2d}] {start_sec:6.2f}s → {end_sec:6.2f}s  (duration: {dur_sec:.2f}s)"
+                )
+
         return "\n".join(lines)
 
     def print_preview(
@@ -103,7 +130,13 @@ class PreviewGenerator:
         silent_segments: List[SilentSegment],
         total_duration_ms: float,
         window_ms: float,
+        buffer_before_ms: float = 0.0,
+        buffer_after_ms: float = 0.0,
     ) -> None:
-        output = self.generate(rms_values, silent_segments, total_duration_ms, window_ms)
+        output = self.generate(
+            rms_values, silent_segments, total_duration_ms, window_ms,
+            buffer_before_ms=buffer_before_ms,
+            buffer_after_ms=buffer_after_ms,
+        )
         sys.stdout.write(output + "\n")
         sys.stdout.flush()

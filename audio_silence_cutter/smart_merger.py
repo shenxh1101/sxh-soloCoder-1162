@@ -44,7 +44,7 @@ class SmartMerger:
                 if not candidates:
                     break
 
-                candidates.sort(key=lambda x: x[1])
+                candidates.sort(key=lambda x: -x[1])
                 target_idx, _ = candidates[0]
 
                 left_idx = min(idx, target_idx)

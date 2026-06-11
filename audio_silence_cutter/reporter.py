@@ -1,7 +1,7 @@
 import os
 import json
-from typing import List, Optional
-from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple
+from dataclasses import dataclass, asdict, field
 from datetime import timedelta
 
 
@@ -14,6 +14,27 @@ class SegmentReport:
     duration_sec: float
     start_timecode: str
     end_timecode: str
+
+
+@dataclass
+class FileResult:
+    filename: str
+    segment_count: int
+    total_duration_sec: float
+    source_duration_sec: float
+    success: bool
+    error_message: str = ""
+
+
+@dataclass
+class BatchSummary:
+    total_files: int
+    success_count: int
+    failure_count: int
+    total_segments: int
+    total_duration_sec: float
+    source_total_duration_sec: float
+    file_results: List[FileResult] = field(default_factory=list)
 
 
 class Reporter:
@@ -133,4 +154,74 @@ class Reporter:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         print(f"  Report saved to: {json_path}")
+        return json_path
+
+    def build_batch_summary(
+        self,
+        file_results: List[FileResult],
+    ) -> BatchSummary:
+        total_files = len(file_results)
+        success_count = sum(1 for r in file_results if r.success)
+        failure_count = total_files - success_count
+        total_segments = sum(r.segment_count for r in file_results if r.success)
+        total_duration = sum(r.total_duration_sec for r in file_results if r.success)
+        source_total = sum(r.source_duration_sec for r in file_results)
+
+        return BatchSummary(
+            total_files=total_files,
+            success_count=success_count,
+            failure_count=failure_count,
+            total_segments=total_segments,
+            total_duration_sec=total_duration,
+            source_total_duration_sec=source_total,
+            file_results=file_results,
+        )
+
+    def print_batch_summary(self, summary: BatchSummary) -> None:
+        print()
+        print("=" * 72)
+        print("  BATCH PROCESSING SUMMARY")
+        print("=" * 72)
+        print(f"  Total files:       {summary.total_files}")
+        print(f"  Successful:        {summary.success_count}")
+        print(f"  Failed:            {summary.failure_count}")
+        print(f"  Total segments:    {summary.total_segments}")
+        print(f"  Output duration:   {summary.total_duration_sec:.2f}s")
+        print(f"  Source duration:   {summary.source_total_duration_sec:.2f}s")
+        print("-" * 72)
+        print(
+            f"  {'#':>3}  {'File':<30} {'Segs':>5} {'Duration':>10} {'Status':>8}"
+        )
+        print("-" * 72)
+        for i, fr in enumerate(summary.file_results):
+            status = "OK" if fr.success else f"FAIL: {fr.error_message[:20]}"
+            print(
+                f"  {i + 1:>3}  {fr.filename:<30} "
+                f"{fr.segment_count:>5} {fr.total_duration_sec:>9.2f}s {status:>8}"
+            )
+        print("-" * 72)
+        print()
+
+    def save_batch_summary_json(
+        self,
+        summary: BatchSummary,
+        batch_dir: str,
+    ) -> str:
+        data = {
+            "summary": {
+                "total_files": summary.total_files,
+                "success_count": summary.success_count,
+                "failure_count": summary.failure_count,
+                "total_segments": summary.total_segments,
+                "total_duration_sec": summary.total_duration_sec,
+                "source_total_duration_sec": summary.source_total_duration_sec,
+            },
+            "files": [asdict(fr) for fr in summary.file_results],
+        }
+
+        json_path = os.path.join(batch_dir, "batch_summary.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        print(f"  Batch summary saved to: {json_path}")
         return json_path

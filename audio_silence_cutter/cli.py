@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -11,7 +11,8 @@ from .audio_splitter import AudioSplitter
 from .smart_merger import SmartMerger
 from .preview import PreviewGenerator
 from .envelope import EnvelopeExporter
-from .reporter import Reporter
+from .config import merge_config, save_config_template, CONFIG_KEYS
+from .reporter import Reporter, FileResult
 
 
 def _load_audio(filepath: str):
@@ -54,6 +55,53 @@ def _audio_to_mono_samples(audio) -> np.ndarray:
     return samples / max_val
 
 
+def _extract_cli_values(parsed_args) -> Dict[str, Any]:
+    mapping = {
+        "threshold_db": "threshold",
+        "min_silence_ms": "min_silence",
+        "buffer_before_ms": "buffer_before",
+        "buffer_after_ms": "buffer_after",
+        "output_dir": "output_dir",
+        "output_format": "output_format",
+        "smart_merge": "smart_merge",
+        "min_segment_ms": "min_segment",
+        "export_envelope": "envelope",
+        "save_report": "save_report",
+        "no_report": "no_report",
+        "batch_summary": "batch_summary",
+    }
+
+    cli_values: Dict[str, Any] = {}
+    for config_key, attr in mapping.items():
+        raw = getattr(parsed_args, attr, None)
+        cli_values[config_key] = raw
+
+    return cli_values
+
+
+def _has_user_override(parsed_args) -> bool:
+    override_fields = [
+        "threshold", "min_silence", "buffer_before", "buffer_after",
+        "output_dir", "output_format", "smart_merge", "min_segment",
+        "envelope", "save_report", "no_report", "batch_summary",
+    ]
+    for field in override_fields:
+        val = getattr(parsed_args, field, None)
+        default = parsed_args_original_defaults.get(field)
+        if val != default:
+            return True
+    return False
+
+
+parsed_args_original_defaults: Dict[str, Any] = {}
+
+
+def _store_defaults(parser: argparse.ArgumentParser, parsed_args) -> None:
+    for action in parser._actions:
+        if action.dest and action.dest != "help":
+            parsed_args_original_defaults[action.dest] = action.default
+
+
 def process_single_file(
     filepath: str,
     threshold_db: float,
@@ -69,11 +117,12 @@ def process_single_file(
     save_report: bool,
     no_report: bool = False,
     preview_only: bool = False,
-) -> int:
+) -> FileResult:
     audio = _load_audio(filepath)
     samples = _audio_to_mono_samples(audio)
     sample_rate = audio.frame_rate
     total_duration_ms = len(audio)
+    source_duration_sec = total_duration_ms / 1000.0
 
     fmt = output_format or _get_format(filepath)
 
@@ -89,11 +138,19 @@ def process_single_file(
         rms_values = detector.get_rms_array(samples, sample_rate)
         preview_gen = PreviewGenerator(width=80, height=20)
         preview_gen.print_preview(
-            rms_values, silent_segments, total_duration_ms, detector.window_ms
+            rms_values, silent_segments, total_duration_ms, detector.window_ms,
+            buffer_before_ms=buffer_before_ms,
+            buffer_after_ms=buffer_after_ms,
         )
 
     if preview_only:
-        return 0
+        return FileResult(
+            filename=os.path.basename(filepath),
+            segment_count=len(non_silent),
+            total_duration_sec=sum(s.duration_ms for s in non_silent) / 1000.0,
+            source_duration_sec=source_duration_sec,
+            success=True,
+        )
 
     splitter = AudioSplitter(
         buffer_before_ms=buffer_before_ms,
@@ -109,7 +166,13 @@ def process_single_file(
 
     if not segments:
         print(f"Warning: No non-silent segments found in '{filepath}'.", file=sys.stderr)
-        return 0
+        return FileResult(
+            filename=os.path.basename(filepath),
+            segment_count=0,
+            total_duration_sec=0.0,
+            source_duration_sec=source_duration_sec,
+            success=True,
+        )
 
     base_name = Path(filepath).stem
     results = splitter.split_audio(audio, segments, base_name, fmt)
@@ -154,8 +217,17 @@ def process_single_file(
             min_segment_ms=min_segment_ms if smart_merge else None,
         )
 
+    total_out_dur = sum(r.duration_sec for r in reports)
+
     print(f"  Done: {len(results)} segment(s) written to '{output_dir}'")
-    return len(results)
+
+    return FileResult(
+        filename=os.path.basename(filepath),
+        segment_count=len(results),
+        total_duration_sec=total_out_dur,
+        source_duration_sec=source_duration_sec,
+        success=True,
+    )
 
 
 def process_batch(
@@ -171,9 +243,12 @@ def process_batch(
     smart_merge: bool,
     min_segment_ms: float,
     save_report: bool,
+    batch_summary: bool,
     no_report: bool = False,
     preview_only: bool = False,
-) -> int:
+) -> None:
+    import time
+
     audio_extensions = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma"}
     dir_path = Path(directory)
 
@@ -191,16 +266,20 @@ def process_batch(
 
     if not audio_files:
         print(f"No audio files found in '{directory}'.")
-        return 0
+        return
 
     print(f"Found {len(audio_files)} audio file(s) in '{directory}'.")
     print()
 
-    total_segments = 0
+    reporter = Reporter(output_dir=output_dir)
+    file_results: List[FileResult] = []
+
+    start_time = time.time()
     for i, audio_file in enumerate(audio_files):
         print(f"[{i + 1}/{len(audio_files)}] Processing: {audio_file.name}")
+        file_start = time.time()
         try:
-            count = process_single_file(
+            result = process_single_file(
                 str(audio_file),
                 threshold_db,
                 min_silence_ms,
@@ -216,13 +295,32 @@ def process_batch(
                 no_report=no_report,
                 preview_only=preview_only,
             )
-            total_segments += count
+            elapsed = time.time() - file_start
+            print(f"  → {result.segment_count} segments, duration: {result.total_duration_sec:.2f}s, took: {elapsed:.1f}s")
+            file_results.append(result)
         except Exception as e:
-            print(f"  Error processing '{audio_file.name}': {e}", file=sys.stderr)
+            elapsed = time.time() - file_start
+            err_msg = str(e)
+            print(f"  → FAILED after {elapsed:.1f}s: {err_msg}", file=sys.stderr)
+            file_results.append(FileResult(
+                filename=audio_file.name,
+                segment_count=0,
+                total_duration_sec=0.0,
+                source_duration_sec=0.0,
+                success=False,
+                error_message=err_msg,
+            ))
 
-    print()
-    print(f"Batch complete: {total_segments} total segment(s) generated.")
-    return total_segments
+    total_elapsed = time.time() - start_time
+
+    summary = reporter.build_batch_summary(file_results)
+    summary.total_files = len(audio_files)
+
+    reporter.print_batch_summary(summary)
+    print(f"  Total time: {total_elapsed:.1f}s")
+
+    if batch_summary:
+        reporter.save_batch_summary_json(summary, output_dir)
 
 
 def main(args: Optional[list] = None):
@@ -235,6 +333,9 @@ Examples:
   # Preview silence detection only
   audio-silence-cutter speech.mp3 --preview-only
 
+  # Preview first, then choose to split
+  audio-silence-cutter speech.mp3 --preview
+
   # Split audio with default settings
   audio-silence-cutter speech.mp3
 
@@ -244,8 +345,14 @@ Examples:
   # With smart merge and envelope export
   audio-silence-cutter speech.mp3 --smart-merge --min-segment 2000 --envelope
 
-  # Batch process a folder
-  audio-silence-cutter --batch ./recordings/ -o ./output/
+  # Batch process a folder with summary
+  audio-silence-cutter --batch ./recordings/ -o ./output/ --batch-summary
+
+  # Use config file (command-line args override config values)
+  audio-silence-cutter speech.mp3 --config my_config.json
+
+  # Save a config template
+  audio-silence-cutter --save-config my_config.json
         """,
     )
 
@@ -257,38 +364,44 @@ Examples:
     parser.add_argument(
         "-t", "--threshold",
         type=float,
-        default=-40.0,
+        default=None,
         help="Silence threshold in dBFS (default: -40.0).",
     )
     parser.add_argument(
         "-s", "--min-silence",
         type=float,
-        default=500.0,
+        default=None,
         help="Minimum silence duration in ms (default: 500).",
     )
     parser.add_argument(
         "--buffer-before",
         type=float,
-        default=200.0,
+        default=None,
         help="Buffer time before split point in ms (default: 200).",
     )
     parser.add_argument(
         "--buffer-after",
         type=float,
-        default=200.0,
+        default=None,
         help="Buffer time after split point in ms (default: 200).",
     )
     parser.add_argument(
         "-o", "--output-dir",
         type=str,
-        default="./output",
+        default=None,
         help="Output directory for split files (default: ./output).",
     )
     parser.add_argument(
         "--output-format",
         type=str,
         choices=["mp3", "wav", "flac", "ogg"],
+        default=None,
         help="Output format override (default: same as input).",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Show ASCII waveform preview before splitting.",
     )
     parser.add_argument(
         "--preview-only",
@@ -298,38 +411,67 @@ Examples:
     parser.add_argument(
         "--envelope",
         action="store_true",
+        default=None,
         help="Export amplitude envelope plots for each segment.",
     )
     parser.add_argument(
         "--smart-merge",
         action="store_true",
+        default=None,
         help="Enable smart merge mode (merge short segments).",
     )
     parser.add_argument(
         "--min-segment",
         type=float,
-        default=1000.0,
+        default=None,
         help="Minimum segment duration for smart merge in ms (default: 1000).",
     )
     parser.add_argument(
         "--no-report",
         action="store_true",
+        default=None,
         help="Do not print the split report.",
     )
     parser.add_argument(
         "--save-report",
         action="store_true",
+        default=None,
         help="Save the report as a JSON file.",
     )
     parser.add_argument(
         "--batch",
         type=str,
+        default=None,
         help="Batch process all audio files in the specified directory.",
+    )
+    parser.add_argument(
+        "--batch-summary",
+        action="store_true",
+        default=None,
+        help="Save a batch summary report as JSON.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to a JSON config file (CLI args override file values).",
+    )
+    parser.add_argument(
+        "--save-config",
+        type=str,
+        default=None,
+        help="Save a config file template to the given path and exit.",
     )
 
     parsed = parser.parse_args(args)
 
-    # Determine input source
+    _store_defaults(parser, parsed)
+
+    if parsed.save_config:
+        save_config_template(parsed.save_config)
+        print(f"Config template saved to: {parsed.save_config}")
+        return
+
     input_path: Optional[str] = None
     is_batch = False
 
@@ -338,45 +480,55 @@ Examples:
         is_batch = True
     elif parsed.input:
         input_path = parsed.input
-    else:
+    elif not parsed.save_config:
         parser.print_help()
         sys.exit(1)
 
-    preview = True if parsed.preview_only else False
+    cli_values = _extract_cli_values(parsed)
+
+    merged = merge_config(
+        cli_args=cli_values,
+        config_path=parsed.config,
+    )
+
     preview_only = parsed.preview_only
-    no_report = parsed.no_report
+    preview = parsed.preview or preview_only
+
+    no_report = merged["no_report"]
+    batch_summary = merged["batch_summary"]
 
     if is_batch:
         process_batch(
             directory=input_path,
-            threshold_db=parsed.threshold,
-            min_silence_ms=parsed.min_silence,
-            buffer_before_ms=parsed.buffer_before,
-            buffer_after_ms=parsed.buffer_after,
-            output_dir=parsed.output_dir,
-            output_format=parsed.output_format,
+            threshold_db=merged["threshold_db"],
+            min_silence_ms=merged["min_silence_ms"],
+            buffer_before_ms=merged["buffer_before_ms"],
+            buffer_after_ms=merged["buffer_after_ms"],
+            output_dir=merged["output_dir"],
+            output_format=merged["output_format"],
             preview=preview,
-            export_envelope=parsed.envelope,
-            smart_merge=parsed.smart_merge,
-            min_segment_ms=parsed.min_segment,
-            save_report=parsed.save_report,
+            export_envelope=merged["export_envelope"],
+            smart_merge=merged["smart_merge"],
+            min_segment_ms=merged["min_segment_ms"],
+            save_report=merged["save_report"],
+            batch_summary=batch_summary,
             no_report=no_report,
             preview_only=preview_only,
         )
     else:
-        process_single_file(
+        result = process_single_file(
             filepath=input_path,
-            threshold_db=parsed.threshold,
-            min_silence_ms=parsed.min_silence,
-            buffer_before_ms=parsed.buffer_before,
-            buffer_after_ms=parsed.buffer_after,
-            output_dir=parsed.output_dir,
-            output_format=parsed.output_format,
+            threshold_db=merged["threshold_db"],
+            min_silence_ms=merged["min_silence_ms"],
+            buffer_before_ms=merged["buffer_before_ms"],
+            buffer_after_ms=merged["buffer_after_ms"],
+            output_dir=merged["output_dir"],
+            output_format=merged["output_format"],
             preview=preview,
-            export_envelope=parsed.envelope,
-            smart_merge=parsed.smart_merge,
-            min_segment_ms=parsed.min_segment,
-            save_report=parsed.save_report,
+            export_envelope=merged["export_envelope"],
+            smart_merge=merged["smart_merge"],
+            min_segment_ms=merged["min_segment_ms"],
+            save_report=merged["save_report"],
             no_report=no_report,
             preview_only=preview_only,
         )
